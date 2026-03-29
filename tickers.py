@@ -1,64 +1,86 @@
 import streamlit as st
 import pandas as pd
 from nasdaq import (fetch_variances, make_request_with_retry, parse_response, extract_date_reported)
+import concurrent.futures
 
-# Function to check ticker platforms
-def check_tickers(ticker):
-    # Initialize a set to store unique platforms
-    platforms = set()
-    
-    # List of ticker files to check
-    ticker_files = [
-        ("IQ_Option_Tickers.txt", "IQ Option"),
-        ("Moneta_Tickers.txt", "Moneta"),
-        ("XTrend_Speed_Tickers.txt", "XTrend Speed")
-    ]
-    
-    # Iterate through each file and corresponding platform name
-    for file_name, platform_name in ticker_files:
+@st.cache_data(ttl=3600) # El caché expira en 1 hora
+def cached_make_request(url):
+    return make_request_with_retry(url)
+
+@st.cache_resource
+def load_all_platforms():
+    ticker_files = {
+        "IQ Option": "IQ_Option_Tickers.txt",
+        "Moneta": "Moneta_Tickers.txt",
+        "XTrend Speed": "XTrend_Speed_Tickers.txt"
+    }
+    platform_data = {}
+    for name, file_path in ticker_files.items():
         try:
-            with open(file_name, "r") as file:
-                # Check if the ticker is in the current file
-                if ticker in file.read().splitlines():
-                    platforms.add(platform_name)
+            with open(file_path, "r") as f:
+                # Usamos set para búsquedas ultrarrápidas
+                platform_data[name] = set(line.strip() for line in f)
         except FileNotFoundError:
-            print(f"Warning: {file_name} not found.")
-        except Exception as e:
-            print(f"Error reading {file_name}: {e}")
+            platform_data[name] = set()
+    return platform_data
 
-    # Return the platforms as a list
-    return {"platforms": list(platforms)}
+PLATFORMS_CACHE = load_all_platforms()
+
+def check_tickers(ticker):
+    platforms = [
+        name for name, tickers in PLATFORMS_CACHE.items() 
+        if ticker in tickers
+    ]
+    return {"platforms": platforms}
+
+def process_single_company(item):
+    """Procesa una empresa individualmente para ser ejecutada en paralelo."""
+    ticker_info = check_tickers(item['symbol'])
+    
+    if ticker_info and ticker_info['platforms']:
+        item['platforms'] = ticker_info['platforms']
+        
+        # Petición de earnings-surprise
+        url = f"https://api.nasdaq.com/api/company/{item['symbol']}/earnings-surprise"
+        response = cached_make_request(url)
+        
+        if response:
+            date_reported_list = extract_date_reported(parse_response(response))
+            if date_reported_list:
+                # fetch_variances ya usa hilos internamente, lo cual es genial
+                variances, avg_variance = fetch_variances(item['time'], item['symbol'], date_reported_list)
+                
+                if variances and any(v > 5 for v in variances):
+                    variances_str = f"{', '.join(map(str, variances))} ({avg_variance})"
+                    return {**item, 'variances': variances_str}
+    return None
 
 # Function to display progress
 def display_progress(companies_list):
     filtered_companies = []
     num_companies = len(companies_list)
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    with st.progress(0):
-        for idx, item in enumerate(companies_list, start=1):
-            # Check for platforms for the current company symbol
-            ticker_info = check_tickers(item['symbol'])
-            if ticker_info and ticker_info['platforms']:
-                item['platforms'] = ticker_info['platforms']  # Append platforms to the item
+    # Usamos ThreadPoolExecutor para procesar múltiples empresas en paralelo
+    # max_workers=10 es un buen balance para no saturar la API
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Mapeamos la función a la lista de empresas
+        future_to_company = {executor.submit(process_single_company, c): c for c in companies_list}
+        
+        for idx, future in enumerate(concurrent.futures.as_completed(future_to_company), 1):
+            result = future.result()
+            if result:
+                filtered_companies.append(result)
+            
+            # Actualizamos la UI
+            progreso = idx / num_companies
+            progress_bar.progress(progreso)
+            status_text.text(f"Analizado {idx}/{num_companies} empresas...")
 
-                date_reported_list = extract_date_reported(
-                    parse_response(
-                        make_request_with_retry(
-                            f"https://api.nasdaq.com/api/company/{item['symbol']}/earnings-surprise"
-                        )
-                    )
-                )
-                if date_reported_list:
-                    variances, avg_variance = fetch_variances(item['time'], item['symbol'], date_reported_list)
-                    if variances and any(variance > 5 for variance in variances):
-                        variances_str = ', '.join(map(str, variances)) + f" ({avg_variance})"
-                        filtered_companies.append({**item, 'variances': variances_str})
-
-            completion_percentage = int((idx / num_companies) * 100)
-            st.progress(completion_percentage)
-
-    st.empty()
-
+    progress_bar.empty()
+    status_text.empty()
     return filtered_companies
 
 # Function to display filtered companies

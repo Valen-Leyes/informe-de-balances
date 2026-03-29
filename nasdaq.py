@@ -7,6 +7,10 @@ from urllib3.util.retry import Retry
 import concurrent.futures
 import json
 
+@st.cache_data(ttl=3600) # El caché expira en 1 hora
+def cached_make_request(url):
+    return make_request_with_retry(url)
+
 # Function to make a GET request with retry mechanism
 def make_request_with_retry(url):
     session = requests.Session()
@@ -66,7 +70,7 @@ def make_historical_data_request(symbol, date_reported, time_slot):
         while True:
             current_date_str = current_date.strftime('%Y-%m-%d')
             url = f"https://api.nasdaq.com/api/quote/{symbol}/historical?assetclass=stocks&fromdate={current_date_str}&limit=365"
-            response = make_request_with_retry(url)
+            response = cached_make_request(url)
             if response and response.status_code == 200:
                 historical_data = response.json()
                 trades_table = historical_data.get('data', {}).get('tradesTable', {}).get('rows', [])
@@ -81,7 +85,7 @@ def make_historical_data_request(symbol, date_reported, time_slot):
         from_date = date_reported_dt.strftime('%Y-%m-%d')
     
     url = f"https://api.nasdaq.com/api/quote/{symbol}/historical?assetclass=stocks&fromdate={from_date}&limit=365"
-    return make_request_with_retry(url)
+    return cached_make_request(url)
 
 # Function to fetch variances
 def fetch_variances(time_slot, symbol, date_reported_list):
@@ -131,7 +135,7 @@ def fetch_variance_for_date(time_slot, symbol, date_reported):
 def fetch_data(selected_date):
     url = f"https://api.nasdaq.com/api/calendar/earnings?date={selected_date}"
     try:
-        response = make_request_with_retry(url)
+        response = cached_make_request(url)
         response.raise_for_status()  # Raise an exception if the request was not successful
         response_data = parse_response(response)
         if not response_data or not response_data.get('data', {}).get('rows'):
